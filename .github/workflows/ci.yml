@@ -12,10 +12,6 @@ jobs:
           shell: bash
         - os: macos-14
           shell: bash
-        - os: windows-2022
-          shell: bash
-        - os: windows-2022
-          shell: powershell
       fail-fast: false
 
     runs-on: ${{ matrix.platform.os }}

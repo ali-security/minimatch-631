@@ -893,9 +893,9 @@ Minimatch.prototype._matchGlobstar = function (file, pattern, partial, fileIndex
 
   // check the tail
   var fileTailMatch = 0
+  /* istanbul ignore next - tail is post-matched by the caller's loop */
   if (tail.length) {
     // if head + tail > file, then we cannot possibly match
-    /* istanbul ignore next */
     if (tail.length + fileIndex > file.length) return false
 
     var tailStart = file.length - tail.length
@@ -905,14 +905,11 @@ Minimatch.prototype._matchGlobstar = function (file, pattern, partial, fileIndex
       // affordance for stuff like a/**/* matching a/b/
       // if the last file portion is '', and there's more to the pattern
       // then try without the '' bit.
-      /* istanbul ignore next */
       if (file[file.length - 1] !== '' ||
           fileIndex + tail.length === file.length) {
         return false
       }
-      /* istanbul ignore next */
       tailStart--
-      /* istanbul ignore next */
       if (!this._matchOneInner(file, tail, partial, tailStart, 0)) {
         return false
       }
