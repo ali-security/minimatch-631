@@ -17,6 +17,17 @@ var plTypes = {
   '@': { open: '(?:', close: ')' }
 }
 
+// Which extglob types an outer extglob can safely "adopt" from a nested one,
+// collapsing *(a|*(b|c)) → *(a|b|c) without changing semantics.
+// See CVE-2026-27904 / GHSA-23c5-xmqv-rm74.
+const adoptionMap = {
+  '*': ['*', '+', '?', '@'],
+  '+': ['+', '@'],
+  '?': ['?', '@'],
+  '@': ['@'],
+  '!': ['!', '@']
+}
+
 // any single thing other than /
 // don't need to escape / when using new RegExp()
 var qmark = '[^/]'
@@ -142,6 +153,10 @@ function Minimatch (pattern, options) {
   }
 
   this.options = options
+  this.maxGlobstarRecursion = options.maxGlobstarRecursion !== undefined
+    ? options.maxGlobstarRecursion : 200
+  this.maxExtglobRecursion = options.maxExtglobRecursion !== undefined
+    ? options.maxExtglobRecursion : 2
   this.set = []
   this.pattern = pattern
   this.regexp = null
@@ -394,6 +409,8 @@ function parse (pattern, isSub) {
         // that there was something like ** or +? in there.
         // Handle the stateChar, then proceed with this one.
         self.debug('call clearStateChar %j', stateChar)
+        // consecutive * characters coalesce into one to prevent ReDoS
+        if (c === '*' && stateChar === '*') continue
         clearStateChar()
         stateChar = c
         // if extglob is disabled, then +(asdf|foo) isn't a thing.
@@ -409,6 +426,45 @@ function parse (pattern, isSub) {
         }
 
         if (!stateChar) {
+          re += '\\('
+          continue
+        }
+
+        // CVE-2026-27904: prevent ReDoS from deeply nested extglobs.
+        //
+        // Strategy (mirrors commit 11d0df6 for the TS/v9+ codebase):
+        //  1. If the nearest real parent extglob can semantically adopt the
+        //     new child type (e.g. * absorbs *, +, ?, @), flatten it inline —
+        //     discard the opening chars, treat '|' as a real alternative
+        //     separator and ')' as a no-op close.  This turns *(*(a|b)) into
+        //     *(a|b) without changing semantics.  Applied regardless of depth.
+        //  2. Otherwise, if we are at or past the depth limit, block the
+        //     nested extglob by emitting its opening chars as regex literals
+        //     and absorbing its ')' / '|' as literals too.
+        //  3. Otherwise (below the limit and cannot flatten) open it normally.
+        var nearestRealType = null
+        for (var si = patternListStack.length - 1; si >= 0; si--) {
+          var stype = patternListStack[si].type
+          if (stype !== null && stype !== 'flatten') {
+            nearestRealType = stype
+            break
+          }
+        }
+        var canAdopt = nearestRealType !== null &&
+          adoptionMap[nearestRealType] &&
+          adoptionMap[nearestRealType].indexOf(stateChar) !== -1
+        if (canAdopt) {
+          // Flatten: discard the stateChar and '(' — the child's alternatives
+          // are passed through as-is into the parent extglob.
+          stateChar = false
+          patternListStack.push({ type: 'flatten', reStart: re.length, open: '', close: '' })
+          continue
+        }
+
+        if (patternListStack.length >= this.maxExtglobRecursion) {
+          // Hard block: emit stateChar and '(' as regex literals.
+          clearStateChar()
+          patternListStack.push({ type: null, reStart: re.length, open: '', close: '' })
           re += '\\('
           continue
         }
@@ -433,8 +489,17 @@ function parse (pattern, isSub) {
         }
 
         clearStateChar()
-        hasMagic = true
         var pl = patternListStack.pop()
+        if (pl.type === null) {
+          // depth-exceeded placeholder — close as literal
+          re += '\\)'
+          continue
+        }
+        if (pl.type === 'flatten') {
+          // transparent flattened placeholder — no output needed
+          continue
+        }
+        hasMagic = true
         // negation is (?:(?!js)[^/]*)
         // The others are (?:<pattern>)<type>
         re += pl.close
@@ -450,6 +515,15 @@ function parse (pattern, isSub) {
           escaping = false
           continue
         }
+
+        var topType = patternListStack[patternListStack.length - 1].type
+        if (topType === null) {
+          // inside a blocked (literal) extglob — keep '|' as literal
+          re += '\\|'
+          continue
+        }
+        // 'flatten' entries pass '|' through as a real separator for the
+        // outer extglob, so fall through to the normal handling below.
 
         clearStateChar()
         re += '|'
@@ -784,19 +858,192 @@ Minimatch.prototype.match = function match (f, partial) {
 // out of pattern, then that's fine, as long as all
 // the parts match.
 Minimatch.prototype.matchOne = function (file, pattern, partial) {
-  var options = this.options
-
   this.debug('matchOne',
     { 'this': this, file: file, pattern: pattern })
 
   this.debug('matchOne', file.length, pattern.length)
 
-  for (var fi = 0,
-      pi = 0,
-      fl = file.length,
-      pl = pattern.length
-      ; (fi < fl) && (pi < pl)
-      ; fi++, pi++) {
+  if (pattern.indexOf(GLOBSTAR) !== -1) {
+    return this._matchGlobstar(file, pattern, partial, 0, 0)
+  }
+
+  return this._matchOneInner(file, pattern, partial, 0, 0)
+}
+
+Minimatch.prototype._matchGlobstar = function (file, pattern, partial, fileIndex, patternIndex) {
+  var options = this.options
+
+  var firstgs = pattern.indexOf(GLOBSTAR, patternIndex)
+  var lastgs = pattern.lastIndexOf(GLOBSTAR)
+
+  var head = pattern.slice(patternIndex, firstgs)
+  var body = pattern.slice(firstgs + 1, lastgs)
+  var tail = pattern.slice(lastgs + 1)
+
+  // check the head
+  /* istanbul ignore next - head is pre-matched by the caller's loop */
+  if (head.length) {
+    var fileHead = file.slice(fileIndex, fileIndex + head.length)
+    if (!this._matchOneInner(fileHead, head, partial, 0, 0)) {
+      return false
+    }
+    fileIndex += head.length
+  }
+  // now we know the head matches!
+
+  // check the tail
+  var fileTailMatch = 0
+  if (tail.length) {
+    // if head + tail > file, then we cannot possibly match
+    /* istanbul ignore next */
+    if (tail.length + fileIndex > file.length) return false
+
+    var tailStart = file.length - tail.length
+    if (this._matchOneInner(file, tail, partial, tailStart, 0)) {
+      fileTailMatch = tail.length
+    } else {
+      // affordance for stuff like a/**/* matching a/b/
+      // if the last file portion is '', and there's more to the pattern
+      // then try without the '' bit.
+      /* istanbul ignore next */
+      if (file[file.length - 1] !== '' ||
+          fileIndex + tail.length === file.length) {
+        return false
+      }
+      /* istanbul ignore next */
+      tailStart--
+      /* istanbul ignore next */
+      if (!this._matchOneInner(file, tail, partial, tailStart, 0)) {
+        return false
+      }
+      fileTailMatch = tail.length + 1
+    }
+  }
+  // now we know the tail matches!
+
+  // the middle is zero or more portions wrapped in **, possibly
+  // containing more ** sections.
+  if (!body.length) {
+    var sawSome = !!fileTailMatch
+    for (var i = fileIndex; i < file.length - fileTailMatch; i++) {
+      var f = String(file[i])
+      sawSome = true
+      if (f === '.' || f === '..' ||
+          (!options.dot && f.charAt(0) === '.')) {
+        return false
+      }
+    }
+    return sawSome
+  }
+
+  // split the body up into globstar-delimited sections
+  var bodySegments = [[[], 0]]
+  var currentBody = bodySegments[0]
+  var nonGsParts = 0
+  var nonGsPartsSums = [0]
+  for (var bi = 0; bi < body.length; bi++) {
+    var b = body[bi]
+    if (b === GLOBSTAR) {
+      nonGsPartsSums.push(nonGsParts)
+      currentBody = [[], 0]
+      bodySegments.push(currentBody)
+    } else {
+      currentBody[0].push(b)
+      nonGsParts++
+    }
+  }
+  var si = bodySegments.length - 1
+  var fileLength = file.length - fileTailMatch
+  for (var bsi = 0; bsi < bodySegments.length; bsi++) {
+    bodySegments[bsi][1] = fileLength - (nonGsPartsSums[si--] + bodySegments[bsi][0].length)
+  }
+
+  return !!this._matchGlobStarBodySections(
+    file,
+    bodySegments,
+    fileIndex,
+    0,
+    partial,
+    0,
+    !!fileTailMatch
+  )
+}
+
+// return false for "nope, not matching"
+// return null for "not matching, cannot keep trying"
+Minimatch.prototype._matchGlobStarBodySections = function (
+  file,
+  bodySegments,
+  fileIndex,
+  bodyIndex,
+  partial,
+  globStarDepth,
+  sawTail
+) {
+  var options = this.options
+  var bs = bodySegments[bodyIndex]
+  if (!bs) {
+    // just make sure that there's no bad dots
+    for (var i = fileIndex; i < file.length; i++) {
+      sawTail = true
+      var f = file[i]
+      if (f === '.' || f === '..' ||
+          (!options.dot && f.charAt(0) === '.')) {
+        return false
+      }
+    }
+    return sawTail
+  }
+
+  var body = bs[0]
+  var after = bs[1]
+  while (fileIndex <= after) {
+    var m = this._matchOneInner(
+      file.slice(0, fileIndex + body.length),
+      body,
+      partial,
+      fileIndex,
+      0
+    )
+    // if limit exceeded, no match. intentional false negative,
+    // acceptable break in correctness for security.
+    if (m && globStarDepth < this.maxGlobstarRecursion) {
+      var sub = this._matchGlobStarBodySections(
+        file,
+        bodySegments,
+        fileIndex + body.length,
+        bodyIndex + 1,
+        partial,
+        globStarDepth + 1,
+        sawTail
+      )
+      if (sub !== false) {
+        return sub
+      }
+    }
+    var ff = file[fileIndex]
+    if (ff === '.' || ff === '..' ||
+        (!options.dot && ff.charAt(0) === '.')) {
+      return false
+    }
+    fileIndex++
+  }
+  // walked off. no point continuing
+  return null
+}
+
+Minimatch.prototype._matchOneInner = function (file, pattern, partial, fileIndex, patternIndex) {
+  var options = this.options
+  var fi, pi, fl, pl
+
+  for (
+    fi = fileIndex,
+    pi = patternIndex,
+    fl = file.length,
+    pl = pattern.length
+    ; (fi < fl) && (pi < pl)
+    ; fi++, pi++
+  ) {
     this.debug('matchOne loop')
     var p = pattern[pi]
     var f = file[fi]
@@ -806,87 +1053,7 @@ Minimatch.prototype.matchOne = function (file, pattern, partial) {
     // should be impossible.
     // some invalid regexp stuff in the set.
     /* istanbul ignore if */
-    if (p === false) return false
-
-    if (p === GLOBSTAR) {
-      this.debug('GLOBSTAR', [pattern, p, f])
-
-      // "**"
-      // a/**/b/**/c would match the following:
-      // a/b/x/y/z/c
-      // a/x/y/z/b/c
-      // a/b/x/b/x/c
-      // a/b/c
-      // To do this, take the rest of the pattern after
-      // the **, and see if it would match the file remainder.
-      // If so, return success.
-      // If not, the ** "swallows" a segment, and try again.
-      // This is recursively awful.
-      //
-      // a/**/b/**/c matching a/b/x/y/z/c
-      // - a matches a
-      // - doublestar
-      //   - matchOne(b/x/y/z/c, b/**/c)
-      //     - b matches b
-      //     - doublestar
-      //       - matchOne(x/y/z/c, c) -> no
-      //       - matchOne(y/z/c, c) -> no
-      //       - matchOne(z/c, c) -> no
-      //       - matchOne(c, c) yes, hit
-      var fr = fi
-      var pr = pi + 1
-      if (pr === pl) {
-        this.debug('** at the end')
-        // a ** at the end will just swallow the rest.
-        // We have found a match.
-        // however, it will not swallow /.x, unless
-        // options.dot is set.
-        // . and .. are *never* matched by **, for explosively
-        // exponential reasons.
-        for (; fi < fl; fi++) {
-          if (file[fi] === '.' || file[fi] === '..' ||
-            (!options.dot && file[fi].charAt(0) === '.')) return false
-        }
-        return true
-      }
-
-      // ok, let's see if we can swallow whatever we can.
-      while (fr < fl) {
-        var swallowee = file[fr]
-
-        this.debug('\nglobstar while', file, fr, pattern, pr, swallowee)
-
-        // XXX remove this slice.  Just pass the start index.
-        if (this.matchOne(file.slice(fr), pattern.slice(pr), partial)) {
-          this.debug('globstar found match!', fr, fl, swallowee)
-          // found a match.
-          return true
-        } else {
-          // can't swallow "." or ".." ever.
-          // can only swallow ".foo" when explicitly asked.
-          if (swallowee === '.' || swallowee === '..' ||
-            (!options.dot && swallowee.charAt(0) === '.')) {
-            this.debug('dot detected!', file, fr, pattern, pr)
-            break
-          }
-
-          // ** swallows a segment, and continue.
-          this.debug('globstar swallow a segment, and continue')
-          fr++
-        }
-      }
-
-      // no match was found.
-      // However, in partial mode, we can't say this is necessarily over.
-      // If there's more *pattern* left, then
-      /* istanbul ignore if */
-      if (partial) {
-        // ran out of file
-        this.debug('\n>>> no match, partial?', file, fr, pattern, pr)
-        if (fr === fl) return true
-      }
-      return false
-    }
+    if (p === false || p === GLOBSTAR) return false
 
     // something other than **
     // non-magic patterns just have to match exactly
